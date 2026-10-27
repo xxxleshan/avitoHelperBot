@@ -6,9 +6,13 @@ Telegram-бот: присылает новые объявления с Авит�
 Фоновый цикл периодически запрашивает выдачу (отсортированную по дате),
 находит новые ID и отправляет их в чат с фото и ссылкой.
  
+Страницы Авито открываются настоящим браузером (Playwright + Chromium): он проходит
+JS-проверку защиты Qrator и хранит cookies между запусками, поэтому банов меньше, чем у httpx.
+ 
 Запуск:
     pip install -r requirements.txt
-    cp .env.example .env    # и впишите туда BOT_TOKEN (и при желании PROXY)
+    playwright install --with-deps chromium   # один раз: скачивает браузер
+    cp .env.example .env    # и впишите туда BOT_TOKEN, ALLOWED_USER_ID и т.д.
     python bot.py
 """
  
@@ -18,12 +22,15 @@ import logging
 import os
 import random
 import re
+import time
 from datetime import date, datetime, timedelta
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from pathlib import Path
+from typing import Any, Awaitable, Callable
+from urllib.parse import urlparse, parse_qs, unquote, urlencode, urlunparse
  
 import aiosqlite
-import httpx
-from typing import Any, Awaitable, Callable
+from playwright.async_api import Browser, BrowserContext, Error as PWError, Page, Playwright
+from playwright.async_api import TimeoutError as PWTimeout, async_playwright
  
 from aiogram import BaseMiddleware, Bot, Dispatcher
 from aiogram.filters import Command, CommandObject
@@ -35,8 +42,11 @@ from dotenv import load_dotenv
 load_dotenv()  # подхватывает переменные из .env рядом с ботом
  
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-PROXY = os.getenv("PROXY")                       # None — без прокси
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "90"))  # пауза между кругами, сек
+# Один или несколько прокси через запятую; пусто — работаем напрямую
+PROXIES: list[str | None] = [p.strip() for p in os.getenv("PROXY", "").split(",") if p.strip()] or [None]
+POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "600"))  # пауза между проверками, сек (600 = 10 мин)
+HEADLESS = os.getenv("HEADLESS", "1").strip().lower() not in ("0", "false", "no")  # 0 — показывать окно браузера
+PROFILE_DIR = Path(os.getenv("PROFILE_DIR", "browser_profiles"))  # здесь хранятся cookies браузера
 DB_PATH = os.getenv("DB_PATH", "avito_bot.db")
 MAX_SUBS_PER_USER = 5
 # Кому разрешено пользоваться ботом: один ID или несколько через запятую
@@ -45,14 +55,9 @@ ALLOWED_USER_IDS = {
 }
 if not ALLOWED_USER_IDS:
     raise SystemExit("Укажите ALLOWED_USER_ID в .env (свой ID можно узнать у @userinfobot)")
+# Кому слать уведомления о банах; если не задан — уведомления только в лог
+ADMIN_ID = int(os.getenv("ADMIN_ID")) if os.getenv("ADMIN_ID", "").strip() else None
  
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/129.0 Safari/537.36"
-    ),
-    "Accept-Language": "ru-RU,ru;q=0.9",
-}
  
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("avito-bot")
@@ -204,10 +209,10 @@ def parse_avito_date(raw: str) -> str:
     return f"{d:%d.%m.%Y} {int(m.group(5)):02d}:{m.group(6)}"
  
  
-async def fetch_details(client: httpx.AsyncClient, item: dict) -> None:
+async def fetch_details(session: "BrowserSession", item: dict) -> None:
     """Догружает со страницы объявления полное описание, точную дату, адрес и рейтинг продавца.
     Селекторы data-marker взяты по вёрстке Авито — при изменении сайта их нужно поправить."""
-    html_page = await fetch(client, item["url"])
+    html_page = await fetch(session, item["url"], ready='[data-marker^="item-view/"]')
     if html_page is None:
         return
     soup = BeautifulSoup(html_page, "lxml")
@@ -241,30 +246,117 @@ async def fetch_details(client: httpx.AsyncClient, item: dict) -> None:
  
  
 class RateLimited(Exception):
-    """Авито ограничил частоту запросов (429/439)."""
+    """Авито ограничил или заблокировал запросы (403/429/439)."""
  
  
-async def fetch(client: httpx.AsyncClient, url: str) -> str | None:
-    r = await client.get(url)
-    if r.status_code in (429, 439):
-        raise RateLimited(r.status_code)
-    if r.status_code != 200:
-        log.warning("Авито вернул %s для %s", r.status_code, url)
+BAN_STATUSES = (401, 403, 429, 439)
+ 
+ 
+def proxy_settings(url: str) -> dict:
+    """http://user:pass@host:port → формат прокси Playwright."""
+    u = urlparse(url)
+    if not u.hostname or not u.port:
+        raise ValueError(f"не хватает хоста или порта: {url}")
+    if u.scheme.startswith("socks") and u.username:
+        raise ValueError(
+            "Chromium не поддерживает SOCKS5 с логином и паролем — укажите прокси как http://логин:пароль@ip:порт"
+        )
+    settings = {"server": f"{u.scheme}://{u.hostname}:{u.port}"}
+    if u.username:
+        settings["username"] = unquote(u.username)
+        settings["password"] = unquote(u.password or "")
+    return settings
+ 
+ 
+class BrowserSession:
+    """Отдельный контекст браузера (свои cookies и прокси) с одной вкладкой, которую переиспользуем."""
+ 
+    def __init__(self, browser: Browser, proxy: str | None, index: int, user_agent: str) -> None:
+        self.browser = browser
+        self.proxy = proxy
+        self.state_path = PROFILE_DIR / f"session_{index}.json"
+        self.user_agent = user_agent
+        self.context: BrowserContext | None = None
+        self.page: Page | None = None
+ 
+    async def start(self) -> None:
+        kwargs: dict[str, Any] = dict(
+            locale="ru-RU",
+            timezone_id="Europe/Moscow",
+            viewport={"width": 1366, "height": 850},
+            user_agent=self.user_agent,
+        )
+        if self.state_path.exists():
+            kwargs["storage_state"] = str(self.state_path)  # cookies с прошлых запусков
+        if self.proxy:
+            kwargs["proxy"] = proxy_settings(self.proxy)
+        self.context = await self.browser.new_context(**kwargs)
+        await self.context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        self.page = await self.context.new_page()
+        # картинки и шрифты страницам не нужны — экономим трафик прокси
+        await self.page.route(
+            "**/*",
+            lambda route: route.abort()
+            if route.request.resource_type in ("image", "media", "font")
+            else route.continue_(),
+        )
+ 
+    async def get_html(self, url: str, ready: str | None) -> tuple[int, str]:
+        assert self.page and self.context
+        resp = await self.page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+        status = resp.status if resp else 0
+        if ready:
+            # при JS-проверке Qrator первый ответ бывает 401/429, затем страница перезагружается сама
+            try:
+                await self.page.wait_for_selector(ready, timeout=20_000 if status != 200 else 10_000)
+                status = 200
+            except PWTimeout:
+                pass
+        await asyncio.sleep(random.uniform(1, 3))  # «читаем» страницу как человек
+        html_page = await self.page.content()
+        await self.context.storage_state(path=str(self.state_path))
+        return status, html_page
+ 
+    async def get_bytes(self, url: str) -> bytes | None:
+        assert self.context
+        r = await self.context.request.get(url, headers={"Referer": "https://www.avito.ru/"}, timeout=20_000)
+        return await r.body() if r.ok else None
+ 
+    async def reset(self) -> None:
+        """Пересоздаёт контекст, например после падения вкладки."""
+        await self.close()
+        await self.start()
+ 
+    async def close(self) -> None:
+        if self.context:
+            try:
+                await self.context.close()
+            except PWError:
+                pass
+        self.context = self.page = None
+ 
+ 
+async def fetch(session: "BrowserSession", url: str, ready: str | None = None) -> str | None:
+    status, html_page = await session.get_html(url, ready)
+    if status in BAN_STATUSES:
+        raise RateLimited(status)
+    if status != 200:
+        log.warning("Авито вернул %s для %s", status, url)
         return None
-    return r.text
+    return html_page
  
  
 # ---------- Отправка ----------
  
-async def download_photos(client: httpx.AsyncClient, item: dict) -> list[BufferedInputFile]:
-    """Качаем фото сами: Telegram не может забрать их с CDN Авито по ссылке."""
+async def download_photos(session: "BrowserSession", item: dict) -> list[BufferedInputFile]:
+    """Качаем фото сами (через тот же браузер и прокси): Telegram не может забрать их с CDN Авито по ссылке."""
     files = []
     for n, url in enumerate(item["photos"]):
         try:
-            r = await client.get(url, headers={"Referer": "https://www.avito.ru/"})
-            if r.status_code == 200 and r.content:
-                files.append(BufferedInputFile(r.content, filename=f"{item['id']}_{n}.jpg"))
-        except httpx.HTTPError as e:
+            content = await session.get_bytes(url)
+            if content:
+                files.append(BufferedInputFile(content, filename=f"{item['id']}_{n}.jpg"))
+        except PWError as e:
             log.warning("Не скачалось фото %s: %s", url, e)
     return files
  
@@ -309,10 +401,10 @@ def format_caption(item: dict) -> str:
     return "\n\n".join(x for x in (head_text, tail_text) if x)
  
  
-async def send_item(bot: Bot, client: httpx.AsyncClient, chat_id: int, item: dict) -> None:
+async def send_item(bot: Bot, session: BrowserSession, chat_id: int, item: dict) -> None:
     caption = format_caption(item)
     try:
-        photos = await download_photos(client, item)
+        photos = await download_photos(session, item)
         if photos:
             mg = MediaGroupBuilder(caption=caption)
             for p in photos:
@@ -327,8 +419,8 @@ async def send_item(bot: Bot, client: httpx.AsyncClient, chat_id: int, item: dic
  
 # ---------- Фоновый опрос ----------
  
-async def check_sub(bot: Bot, client: httpx.AsyncClient, sub_id: int, chat_id: int, url: str, primed: int) -> None:
-    html = await fetch(client, url)
+async def check_sub(bot: Bot, session: BrowserSession, sub_id: int, chat_id: int, url: str, primed: int) -> None:
+    html = await fetch(session, url, ready='[data-marker="item"]')
     if html is None:
         return
     items = parse_listing(html)
@@ -362,13 +454,13 @@ async def check_sub(bot: Bot, client: httpx.AsyncClient, sub_id: int, chat_id: i
         if details_allowed:
             await asyncio.sleep(random.uniform(2, 5))
             try:
-                await fetch_details(client, item)
+                await fetch_details(session, item)
             except RateLimited:
                 details_allowed = False  # остальные отправим с данными из выдачи
                 log.warning("Лимит при загрузке карточки %s, шлю без деталей", item["id"])
-            except httpx.HTTPError as e:
+            except PWError as e:
                 log.warning("Не удалось загрузить карточку %s: %s", item["id"], e)
-        await send_item(bot, client, chat_id, item)
+        await send_item(bot, session, chat_id, item)
         await asyncio.sleep(0.5)
     for item, old_price in price_changes:
         arrow = "📉" if item["price_value"] < old_price else "📈"
@@ -380,32 +472,145 @@ async def check_sub(bot: Bot, client: httpx.AsyncClient, sub_id: int, chat_id: i
         await asyncio.sleep(0.5)
  
  
-async def poll_loop(bot: Bot) -> None:
-    async with httpx.AsyncClient(headers=HEADERS, proxy=PROXY, timeout=20, follow_redirects=True) as client:
-        cooldown = 0  # растёт при блокировках, сбрасывается после успешного круга
+class ProxyPool:
+    """Один браузер, по контексту на каждый прокси. При бане текущий прокси «отдыхает», бот берёт следующий."""
+ 
+    def __init__(self, proxies: list[str | None]) -> None:
+        for p in proxies:
+            if p:
+                proxy_settings(p)  # проверяем формат заранее, чтобы бот упал сразу с понятной ошибкой
+        self.proxies = proxies
+        # в логах прячем логин и пароль
+        self.names = [re.sub(r"//[^@/]+@", "//***@", p) if p else "без прокси" for p in proxies]
+        self.banned_until = [0.0] * len(proxies)
+        self.strikes = [0] * len(proxies)
+        self.i = 0
+        self.pw: Playwright | None = None
+        self.browser: Browser | None = None
+        self.sessions: list[BrowserSession] = []
+ 
+    async def start(self) -> None:
+        PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        self.pw = await async_playwright().start()
+        self.browser = await self.pw.chromium.launch(
+            channel="chromium",  # полноценный Chromium в новом headless-режиме, его сложнее распознать
+            headless=HEADLESS,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        major = self.browser.version.split(".")[0]
+        user_agent = (
+            f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+        )
+        for n, p in enumerate(self.proxies):
+            session = BrowserSession(self.browser, p, n, user_agent)
+            await session.start()
+            self.sessions.append(session)
+ 
+    @property
+    def clients(self) -> list[BrowserSession]:
+        return self.sessions
+ 
+    @property
+    def client(self) -> BrowserSession:
+        return self.sessions[self.i]
+ 
+    def mark_ok(self) -> None:
+        self.strikes[self.i] = 0
+ 
+    def ban_current(self) -> int:
+        self.strikes[self.i] += 1
+        cooldown = min(300 * 2 ** (self.strikes[self.i] - 1), 1800)  # 5 → 10 → 20 → 30 мин
+        self.banned_until[self.i] = time.monotonic() + cooldown
+        log.warning("Прокси %s заблокирован Авито, отдыхает %s сек", self.names[self.i], cooldown)
+        return cooldown
+ 
+    def switch(self) -> float:
+        """Переходит на свободный прокси. Возвращает, сколько ждать, если свободных нет."""
+        now = time.monotonic()
+        n = len(self.clients)
+        for k in range(1, n + 1):
+            j = (self.i + k) % n
+            if self.banned_until[j] <= now:
+                self.i = j
+                log.info("Переключаюсь на прокси %s", self.names[j])
+                return 0
+        self.i = min(range(n), key=lambda j: self.banned_until[j])
+        return self.banned_until[self.i] - now
+ 
+    async def aclose(self) -> None:
+        for s in self.sessions:
+            await s.close()
+        if self.browser:
+            await self.browser.close()
+        if self.pw:
+            await self.pw.stop()
+ 
+ 
+async def notify_admin(bot: Bot, text: str) -> None:
+    if ADMIN_ID is None:
+        return
+    try:
+        await bot.send_message(ADMIN_ID, text, parse_mode="HTML")
+    except Exception as e:
+        log.warning("Не удалось уведомить администратора: %s", e)
+ 
+ 
+async def poll_loop(bot: Bot, pool: "ProxyPool") -> None:
+    log.info("Прокси в работе: %s", ", ".join(pool.names))
+    try:
         while True:
             async with db.execute("SELECT id, chat_id, url, primed FROM subs") as cur:
                 subs = await cur.fetchall()
-            limited = False
             for sub in subs:
-                try:
-                    await check_sub(bot, client, *sub)
-                except RateLimited as e:
-                    limited = True
-                    log.warning("Авито ограничил запросы (%s), прерываю круг", e)
-                    break
-                except httpx.TimeoutException:
-                    log.warning("Таймаут при проверке подписки %s", sub[0])
-                except Exception:
-                    log.exception("Ошибка при проверке подписки %s", sub[0])
-                await asyncio.sleep(random.uniform(3, 8))  # не долбим Авито подряд
-            if limited:
-                cooldown = min(cooldown * 2 or 300, 1800)  # 5 → 10 → 20 → 30 мин
-                log.info("Пауза %s сек из-за ограничения", cooldown)
-                await asyncio.sleep(cooldown)
-            else:
-                cooldown = 0
-                await asyncio.sleep(POLL_INTERVAL + random.uniform(0, 30))
+                for _ in range(len(pool.clients) + 1):  # пробуем подписку на разных прокси
+                    try:
+                        await check_sub(bot, pool.client, *sub)
+                        pool.mark_ok()
+                        break
+                    except RateLimited as e:
+                        banned = pool.names[pool.i]
+                        strikes = pool.strikes[pool.i] + 1
+                        cooldown = pool.ban_current()
+                        wait = pool.switch()
+                        text = (
+                            f"⚠️ <b>Бан от Авито</b> (HTTP {e})\n"
+                            f"Прокси: <code>{html.escape(banned)}</code>\n"
+                            f"Блокировка подряд: {strikes}, пауза {cooldown // 60} мин"
+                        )
+                        if wait > 0:
+                            text += f"\n\n🛑 Все прокси заблокированы, парсинг стоит ~{wait / 60:.0f} мин"
+                        else:
+                            text += f"\nПереключился на <code>{html.escape(pool.names[pool.i])}</code>"
+                        await notify_admin(bot, text)
+                        if wait > 0:
+                            log.info("Все прокси заблокированы, жду %.0f сек", wait)
+                            await asyncio.sleep(wait)
+                    except PWError as e:
+                        # прокси не отвечает, не может достучаться до Авито или вкладка упала — пробуем следующий
+                        broken = pool.names[pool.i]
+                        log.warning("Прокси %s не работает: %s", broken, str(e).splitlines()[0])
+                        try:
+                            await pool.client.reset()
+                        except PWError:
+                            log.exception("Не удалось пересоздать вкладку браузера")
+                        pool.ban_current()
+                        wait = pool.switch()
+                        await notify_admin(
+                            bot,
+                            f"🔌 <b>Прокси не работает</b>\n<code>{html.escape(broken)}</code>\n"
+                            f"{html.escape(type(e).__name__)}: {html.escape(str(e).splitlines()[0])[:200]}",
+                        )
+                        if wait > 0:
+                            break  # все прокси нерабочие — попробуем на следующем круге
+                    except Exception:
+                        log.exception("Ошибка при проверке подписки %s", sub[0])
+                        break
+                await asyncio.sleep(random.uniform(5, 15))  # не долбим Авито подряд
+            # небольшой разброс, чтобы запросы не шли строго по таймеру
+            await asyncio.sleep(POLL_INTERVAL + random.uniform(0, POLL_INTERVAL * 0.2))
+    finally:
+        await pool.aclose()
  
  
 # ---------- Команды ----------
@@ -469,7 +674,22 @@ async def cmd_del(message: Message, command: CommandObject) -> None:
 async def main() -> None:
     await init_db()
     bot = Bot(BOT_TOKEN)
-    asyncio.create_task(poll_loop(bot))
+    try:
+        pool = ProxyPool(PROXIES)  # ошибки настройки прокси останавливают бота сразу
+        await pool.start()
+    except ValueError as e:
+        raise SystemExit(f"Неверный адрес прокси в PROXY: {e}")
+    except PWError as e:
+        raise SystemExit(
+            f"Не удалось запустить браузер: {str(e).splitlines()[0]}\n"
+            "Выполните: playwright install --with-deps chromium"
+        )
+    log.info("Браузер запущен (headless=%s), проверка раз в %s сек", HEADLESS, POLL_INTERVAL)
+    poll_task = asyncio.create_task(poll_loop(bot, pool))
+    poll_task.add_done_callback(
+        lambda t: t.cancelled() or t.exception() is None
+        or log.critical("Цикл опроса упал", exc_info=t.exception())
+    )
     try:
         await dp.start_polling(bot)
     finally:
@@ -478,4 +698,3 @@ async def main() -> None:
  
 if __name__ == "__main__":
     asyncio.run(main())
- 
